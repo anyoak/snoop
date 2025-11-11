@@ -1,0 +1,663 @@
+import asyncio
+import logging
+import re
+import time
+from datetime import datetime, timedelta
+from seleniumbase import Driver
+from selenium.webdriver.common.by import By
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
+from selenium.common.exceptions import TimeoutException, NoSuchElementException
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, CallbackQueryHandler
+from telegram.constants import ParseMode
+import threading
+
+# Bot Configuration
+BOT_TOKEN = "8451064449:AAEPx61lC2inHPtHaf3XVoMcSdmopJqJSpg"  # Replace with your actual bot token
+ADMIN_ID = 6577308099
+
+# Website URLs
+LOGIN_URL = "https://www.abcproxy.com/login.html"
+BASE_URL = "https://www.abcproxy.com"
+MONITOR_URL = "https://www.abcproxy.com/center/getproxy.html?tab=account"
+
+# Global session management
+last_refresh_time = None
+session_lock = threading.Lock()
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler('bot_activity.log', encoding='utf-8'),
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger(__name__)
+
+class ABCProxyMonitorBot:
+    def __init__(self):
+        self.driver = None
+        self.wait = None
+        self.application = None
+        
+    def initialize_driver(self):
+        """Initialize the WebDriver"""
+        try:
+            self.driver = Driver(uc=True, headless=False)
+            self.wait = WebDriverWait(self.driver, 20)
+            logger.info("✅ Driver initialized successfully")
+            return True
+        except Exception as e:
+            logger.error(f"❌ Failed to initialize driver: {e}")
+            return False
+
+    def open_login_url(self):
+        """Open the login URL"""
+        try:
+            logger.info("🌐 Opening login URL...")
+            self.driver.get(LOGIN_URL)
+            self.wait.until(EC.presence_of_element_located((By.TAG_NAME, "body")))
+            logger.info("✅ Login page loaded successfully")
+            return True
+        except Exception as e:
+            logger.error(f"❌ Failed to open login URL: {e}")
+            return False
+
+    def wait_for_manual_login(self):
+        """Wait for manual login by user"""
+        try:
+            logger.info("🔐 Please login manually in the browser...")
+            logger.info("✅ Script will continue automatically after successful login")
+            
+            original_url = self.driver.current_url
+            
+            # Wait for URL change indicating successful login
+            WebDriverWait(self.driver, 300).until(
+                lambda driver: driver.current_url != original_url and 
+                              "login" not in driver.current_url.lower()
+            )
+            
+            logger.info(f"✅ Login successful! Current URL: {self.driver.current_url}")
+            return True
+            
+        except TimeoutException:
+            logger.warning("⚠️ Login timeout reached")
+            return False
+        except Exception as e:
+            logger.error(f"❌ Error during login wait: {e}")
+            return False
+
+    def navigate_to_monitor_page(self):
+        """Navigate to the account monitor page with better waiting"""
+        try:
+            logger.info("🔄 Navigating to monitor page...")
+            self.driver.get(MONITOR_URL)
+            
+            # Wait for the page to load completely
+            time.sleep(5)
+            
+            # Wait for account table to load
+            self.wait.until(EC.presence_of_element_located((By.CLASS_NAME, "all_acu_box")))
+            
+            # Additional wait for account rows to populate
+            WebDriverWait(self.driver, 10).until(
+                lambda driver: len(driver.find_elements(By.CSS_SELECTOR, ".all_acu_box > div")) > 0
+            )
+            
+            logger.info("✅ Monitor page loaded successfully")
+            return True
+            
+        except Exception as e:
+            logger.error(f"❌ Failed to navigate to monitor page: {e}")
+            return False
+
+    def refresh_session_if_needed(self):
+        """Refresh browser session every 30 minutes"""
+        global last_refresh_time
+        
+        with session_lock:
+            current_time = datetime.now()
+            if (last_refresh_time is None or 
+                (current_time - last_refresh_time) > timedelta(minutes=30)):
+                
+                logger.info("🔄 Refreshing browser session (30 minutes interval)")
+                if self.driver:
+                    self.driver.quit()
+                
+                if not self.initialize_driver():
+                    return False
+                if not self.open_login_url():
+                    return False
+                if not self.wait_for_manual_login():
+                    return False
+                if not self.navigate_to_monitor_page():
+                    return False
+                
+                last_refresh_time = current_time
+                logger.info("✅ Browser session refreshed successfully")
+            else:
+                logger.info("✅ Using existing browser session")
+            
+            return True
+
+    def extract_account_name(self, user_input):
+        """Extract account name from various input formats"""
+        try:
+            cleaned_input = user_input.strip()
+            
+            # Pattern 1: Full proxy string with colons
+            if ":" in cleaned_input:
+                parts = cleaned_input.split(":")
+                if len(parts) >= 3:
+                    account_part = parts[2]
+                    if "-zone-" in account_part:
+                        account_name = account_part.split("-zone-")[0]
+                    else:
+                        account_name = account_part
+                    logger.info(f"✅ Extracted account name: {account_name}")
+                    return account_name
+            
+            # Pattern 2: Direct account name
+            logger.info(f"✅ Using direct account name: {cleaned_input}")
+            return cleaned_input
+            
+        except Exception as e:
+            logger.error(f"❌ Error extracting account name: {e}")
+            return user_input.strip()
+
+    def search_account_in_table(self, account_name):
+        """Search for account in the account table"""
+        try:
+            logger.info(f"🔍 Searching for account: {account_name}")
+            
+            # Wait for table to load completely
+            time.sleep(3)
+            
+            # Find all account rows - they are divs inside all_acu_box
+            account_rows = self.driver.find_elements(By.CSS_SELECTOR, ".all_acu_box > div")
+            
+            logger.info(f"📊 Found {len(account_rows)} account rows")
+            
+            for index, row in enumerate(account_rows):
+                try:
+                    # Get all spans in this row
+                    spans = row.find_elements(By.TAG_NAME, "span")
+                    if not spans:
+                        continue
+                    
+                    # The first span should contain the account name
+                    account_span = spans[0]
+                    row_account_name = account_span.text.strip()
+                    
+                    logger.info(f"🔍 Checking row {index}: '{row_account_name}' vs '{account_name}'")
+                    
+                    if account_name.lower() in row_account_name.lower():
+                        logger.info(f"✅ Exact match found: {row_account_name}")
+                        return self.extract_account_data(row, account_name)
+                        
+                except NoSuchElementException:
+                    continue
+                except Exception as e:
+                    logger.warning(f"⚠️ Error checking row {index}: {e}")
+                    continue
+            
+            logger.warning(f"⚠️ Account not found: {account_name}")
+            return None
+            
+        except Exception as e:
+            logger.error(f"❌ Error searching account table: {e}")
+            return None
+
+    def extract_account_data(self, row, account_name):
+        """Extract account data from table row using proper CSS selectors"""
+        try:
+            # Get all spans in the row
+            spans = row.find_elements(By.TAG_NAME, "span")
+            
+            # Based on HTML structure, spans should be in this order:
+            # [0] Account Name, [1] Password, [2] Traffic Limit, [3] Traffic Usage, 
+            # [4] Add Time, [5] Status, [6] Remark, [7] Operate
+            
+            if len(spans) < 6:
+                logger.warning(f"⚠️ Not enough spans in row: {len(spans)}")
+                return None
+            
+            # Extract data from specific span indices
+            traffic_limit = spans[2].text.strip() if len(spans) > 2 else "0"
+            traffic_usage = spans[3].text.strip() if len(spans) > 3 else "0"
+            add_time = spans[4].text.strip() if len(spans) > 4 else "N/A"
+            status = spans[5].text.strip() if len(spans) > 5 else "Unknown"
+            
+            # Clean the data
+            traffic_limit = self.clean_traffic_value(traffic_limit)
+            traffic_usage = self.clean_traffic_value(traffic_usage)
+            
+            account_data = {
+                'account_name': account_name,
+                'traffic_limit_gb': traffic_limit,
+                'traffic_usage_mb': traffic_usage,
+                'add_time': add_time,
+                'status': status
+            }
+            
+            logger.info(f"📊 Raw account data extracted: {account_data}")
+            return account_data
+            
+        except Exception as e:
+            logger.error(f"❌ Error extracting account data: {e}")
+            return None
+
+    def clean_traffic_value(self, value):
+        """Clean traffic values and convert to appropriate units"""
+        try:
+            if not value or value == "N/A":
+                return "0"
+            
+            # Remove any non-numeric characters except decimal point
+            cleaned = re.sub(r'[^\d.]', '', value)
+            if cleaned:
+                return cleaned
+            return "0"
+        except:
+            return "0"
+
+    def debug_table_structure(self):
+        """Debug method to see actual table structure"""
+        try:
+            logger.info("🔍 Debugging table structure...")
+            
+            # Get the main table container
+            table_container = self.driver.find_element(By.CLASS_NAME, "all_acu_box")
+            
+            # Get all rows
+            rows = table_container.find_elements(By.CSS_SELECTOR, "> div")
+            logger.info(f"📊 Found {len(rows)} rows in table")
+            
+            for i, row in enumerate(rows):
+                spans = row.find_elements(By.TAG_NAME, "span")
+                row_data = [span.text for span in spans]
+                logger.info(f"Row {i}: {row_data}")
+                
+        except Exception as e:
+            logger.error(f"❌ Debug error: {e}")
+
+    def calculate_traffic_left(self, limit_gb, usage_mb):
+        """Calculate remaining traffic in MB"""
+        try:
+            limit_gb_float = float(limit_gb)
+            usage_mb_float = float(usage_mb)
+            
+            # Convert GB to MB (1 GB = 1024 MB)
+            limit_mb = limit_gb_float * 1024
+            left_mb = limit_mb - usage_mb_float
+            
+            return left_mb
+        except:
+            return 0.00
+
+    def calculate_usage_percentage(self, limit_gb, usage_mb):
+        """Calculate usage percentage"""
+        try:
+            limit_gb_float = float(limit_gb)
+            usage_mb_float = float(usage_mb)
+            
+            if limit_gb_float == 0:
+                return 0
+                
+            limit_mb = limit_gb_float * 1024
+            
+            if limit_mb == 0:
+                return 0
+                
+            percentage = (usage_mb_float / limit_mb) * 100
+            return min(percentage, 100)
+        except:
+            return 0
+
+    def format_traffic_limit(self, limit_gb):
+        """Format traffic limit with GB unit"""
+        try:
+            return f"{float(limit_gb):.0f} GB" if float(limit_gb).is_integer() else f"{limit_gb} GB"
+        except:
+            return "0 GB"
+
+    def format_traffic_usage(self, usage_mb):
+        """Format traffic usage with MB unit"""
+        try:
+            return f"{float(usage_mb):.2f} MB"
+        except:
+            return "0.00 MB"
+
+    def format_traffic_left(self, left_mb):
+        """Format remaining traffic"""
+        try:
+            return f"{left_mb:.2f} MB"
+        except:
+            return "0.00 MB"
+
+    def get_usage_emoji(self, percentage):
+        """Get emoji based on usage percentage"""
+        if percentage < 50:
+            return "🟢"
+        elif percentage < 80:
+            return "🟡"
+        else:
+            return "🔴"
+
+    def format_account_message(self, account_data):
+        """Format account overview message"""
+        try:
+            left_mb = self.calculate_traffic_left(
+                account_data['traffic_limit_gb'], 
+                account_data['traffic_usage_mb']
+            )
+            
+            usage_percentage = self.calculate_usage_percentage(
+                account_data['traffic_limit_gb'], 
+                account_data['traffic_usage_mb']
+            )
+            
+            formatted_limit = self.format_traffic_limit(account_data['traffic_limit_gb'])
+            formatted_usage = self.format_traffic_usage(account_data['traffic_usage_mb'])
+            formatted_left = self.format_traffic_left(left_mb)
+            
+            status_icon = "🟢" if "enable" in account_data['status'].lower() else "🔴"
+            usage_emoji = self.get_usage_emoji(usage_percentage)
+            
+            message = f"""
+╔═━Account Overview━═╗
+┣🌐 Username ➜ {account_data['account_name']}
+┣🔐 Reg. Date ➜ {account_data['add_time']}
+┣🪝Limit ➜ {formatted_limit}
+┣🟥 Usage ➜ {formatted_usage}
+┣🟩 Left ➜ {formatted_left}
+╚═━━ ◢◤ ABC ◥◣ ━━━═╝
+            """.strip()
+            
+            # Create inline keyboard with percentage
+            keyboard = InlineKeyboardMarkup([[
+                InlineKeyboardButton(
+                    f"{usage_emoji} {usage_percentage:.1f}% Used | {status_icon} Active", 
+                    callback_data="do_nothing"
+                )
+            ]])
+            
+            return message, keyboard
+            
+        except Exception as e:
+            logger.error(f"❌ Error formatting message: {e}")
+            return "❌ Error formatting account information", None
+
+    def process_multiple_accounts(self, account_names):
+        """Process multiple accounts in one session"""
+        results = {}
+        
+        try:
+            # Refresh session if needed
+            if not self.refresh_session_if_needed():
+                return {name: (None, "❌ Session refresh failed") for name in account_names}
+            
+            # Debug: Check table structure
+            self.debug_table_structure()
+            
+            for account_name in account_names:
+                logger.info(f"🔍 Processing account: {account_name}")
+                
+                account_data = self.search_account_in_table(account_name)
+                
+                if account_data:
+                    message, keyboard = self.format_account_message(account_data)
+                    results[account_name] = (message, keyboard)
+                    logger.info(f"✅ Account processed: {account_name}")
+                else:
+                    results[account_name] = (None, "🚫 Your input is invalid or not registered in our system records.")
+                    logger.warning(f"⚠️ Account not found: {account_name}")
+                
+                time.sleep(1)
+            
+            return results
+            
+        except Exception as e:
+            logger.error(f"❌ Error processing multiple accounts: {e}")
+            return {name: (None, f"❌ System error: {str(e)}") for name in account_names}
+
+    def run_account_check(self, account_names):
+        """Main method to run account check for multiple accounts"""
+        try:
+            if not self.driver:
+                if not self.initialize_driver():
+                    return {name: (None, "❌ Failed to initialize browser") for name in account_names}
+                
+                if not self.open_login_url():
+                    return {name: (None, "❌ Failed to open login page") for name in account_names}
+                
+                if not self.wait_for_manual_login():
+                    return {name: (None, "❌ Login failed or timeout") for name in account_names}
+                
+                if not self.navigate_to_monitor_page():
+                    return {name: (None, "❌ Failed to navigate to monitor page") for name in account_names}
+            
+            results = self.process_multiple_accounts(account_names)
+            return results
+            
+        except Exception as e:
+            logger.error(f"❌ Error in account check: {e}")
+            return {name: (None, f"❌ System error: {str(e)}") for name in account_names}
+
+    # Telegram Bot Methods
+    async def start_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Send welcome message when the command /start is issued."""
+        welcome_message = """
+🤖 *Welcome to ABC Proxy Account Monitor Bot!*
+
+*How to use this bot:*
+1. Send your account name or proxy string
+2. Send multiple accounts (one per line) for batch checking
+3. The bot will sync with ABC Cloud System
+4. Get your account overview instantly
+
+*Supported input formats:*
+- `anam1gbPL2510` (direct account name)
+- `as.domain.com:4950:anam1gbPL2510-zone-region:password` (full proxy string)
+
+*Features:*
+• Account traffic usage with percentage
+• Registration date
+• Status monitoring
+• Real-time updates
+• Multi-account support
+
+*Start by sending your account name or proxy string!*
+        """
+        
+        await update.message.reply_text(
+            welcome_message,
+            parse_mode=ParseMode.MARKDOWN
+        )
+
+    async def handle_account_query(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle account query messages"""
+        user_input = update.message.text.strip()
+        chat_id = update.message.chat_id
+        
+        if not user_input:
+            await update.message.reply_text("❌ Please provide an account name or proxy string.")
+            return
+        
+        # Extract account names (support multiple lines)
+        input_lines = user_input.split('\n')
+        account_names = []
+        
+        for line in input_lines:
+            line = line.strip()
+            if line:
+                account_name = self.extract_account_name(line)
+                if account_name:
+                    account_names.append(account_name)
+        
+        if not account_names:
+            await update.message.reply_text("❌ No valid account names found in your input.")
+            return
+        
+        # Send loading message with countdown
+        loading_text = f"🤖 Syncing with ABC Cloud System...\n📊 Checking {len(account_names)} account(s)...(10s)"
+        loading_message = await update.message.reply_text(loading_text)
+        
+        # Countdown animation
+        for i in range(9, 0, -1):
+            try:
+                await context.bot.edit_message_text(
+                    chat_id=chat_id,
+                    message_id=loading_message.message_id,
+                    text=f"🤖 Syncing with ABC Cloud System...\n📊 Checking {len(account_names)} account(s)...({i}s)"
+                )
+                await asyncio.sleep(1)
+            except:
+                pass
+        
+        # Process all accounts
+        results = self.run_account_check(account_names)
+        
+        # Send results
+        success_count = 0
+        for account_name, (message, keyboard) in results.items():
+            if message and keyboard:
+                await context.bot.send_message(
+                    chat_id=chat_id,
+                    text=message,
+                    reply_markup=keyboard,
+                    parse_mode=ParseMode.MARKDOWN
+                )
+                success_count += 1
+            else:
+                error_msg = keyboard if keyboard else "❌ Unknown error"
+                await context.bot.send_message(
+                    chat_id=chat_id,
+                    text=f"🔍 Account: {account_name}\n{error_msg}"
+                )
+        
+        # Delete loading message
+        try:
+            await context.bot.delete_message(chat_id=chat_id, message_id=loading_message.message_id)
+        except:
+            pass
+        
+        # Send summary
+        if success_count > 0:
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text=f"✅ Successfully processed {success_count} out of {len(account_names)} account(s)"
+            )
+
+    async def handle_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle inline keyboard callbacks"""
+        query = update.callback_query
+        await query.answer()
+
+    async def broadcast_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle broadcast messages from admin"""
+        if update.effective_user.id != ADMIN_ID:
+            await update.message.reply_text("❌ Unauthorized access.")
+            return
+        
+        if not context.args:
+            await update.message.reply_text("❌ Usage: /broadcast <message>")
+            return
+        
+        broadcast_text = " ".join(context.args)
+        
+        await update.message.reply_text(
+            f"📢 Broadcast message prepared:\n\n{broadcast_text}\n\n"
+            f"*This would be sent to all users.*",
+            parse_mode=ParseMode.MARKDOWN
+        )
+
+    async def status_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Show bot status and session info"""
+        global last_refresh_time
+        
+        status_message = f"""
+🤖 *Bot Status Overview*
+
+*Session Information:*
+• Last Refresh: {last_refresh_time.strftime('%Y-%m-%d %H:%M:%S') if last_refresh_time else 'Never'}
+• Next Refresh: {(last_refresh_time + timedelta(minutes=30)).strftime('%Y-%m-%d %H:%M:%S') if last_refresh_time else 'N/A'}
+• Browser Active: {'✅ Yes' if self.driver else '❌ No'}
+
+*Features:*
+• Multi-account support ✅
+• Auto-refresh every 30 minutes ✅
+• Percentage-based usage display ✅
+• Error handling and recovery ✅
+
+*Usage:*
+Send account names (one per line) for batch checking!
+        """
+        
+        await update.message.reply_text(status_message, parse_mode=ParseMode.MARKDOWN)
+
+    async def handle_media_broadcast(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle media broadcast from admin"""
+        if update.effective_user.id != ADMIN_ID:
+            return
+        
+        media_type = "Unknown"
+        if update.message.photo:
+            media_type = "Photo"
+        elif update.message.video:
+            media_type = "Video"
+        elif update.message.document:
+            media_type = "Document"
+        elif update.message.animation:
+            media_type = "GIF"
+        
+        await update.message.reply_text(f"✅ {media_type} broadcast ready to send to all users.")
+
+    def setup_handlers(self):
+        """Setup Telegram bot handlers"""
+        # Command handlers
+        self.application.add_handler(CommandHandler("start", self.start_command))
+        self.application.add_handler(CommandHandler("broadcast", self.broadcast_command))
+        self.application.add_handler(CommandHandler("status", self.status_command))
+        
+        # Message handlers
+        self.application.add_handler(MessageHandler(
+            filters.TEXT & ~filters.COMMAND, 
+            self.handle_account_query
+        ))
+        
+        # Media handlers for admin broadcast
+        self.application.add_handler(MessageHandler(
+            filters.PHOTO | filters.VIDEO | filters.Document.ALL | filters.ANIMATION,
+            self.handle_media_broadcast
+        ))
+        
+        # Callback query handler
+        self.application.add_handler(CallbackQueryHandler(self.handle_callback))
+
+    def run_bot(self):
+        """Run the Telegram bot"""
+        self.application = Application.builder().token(BOT_TOKEN).build()
+        self.setup_handlers()
+        
+        logger.info("🤖 Bot is running...")
+        self.application.run_polling()
+
+def main():
+    """Main function"""
+    print("🚀 Starting ABC Proxy Account Monitor Bot...")
+    print("📝 Make sure to replace 'YOUR_BOT_TOKEN_HERE' with your actual bot token")
+    
+    if BOT_TOKEN == "YOUR_BOT_TOKEN_HERE":
+        print("❌ ERROR: Please set your bot token in the BOT_TOKEN variable")
+        return
+    
+    # Create and run the bot
+    bot = ABCProxyMonitorBot()
+    bot.run_bot()
+
+if __name__ == "__main__":
+    main()
