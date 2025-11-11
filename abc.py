@@ -14,7 +14,7 @@ from telegram.constants import ParseMode
 import threading
 
 # Bot Configuration
-BOT_TOKEN = "8451064449:AAEPx61lC2inHPtHaf3XVoMcSdmopJqJSpg"  # Replace with your actual bot token
+BOT_TOKEN = "8451064449:AAEPx61lC2inHPtHaf3XVoMcSdmopJqJSpg"
 ADMIN_ID = 6577308099
 
 # Website URLs
@@ -25,6 +25,8 @@ MONITOR_URL = "https://www.abcproxy.com/center/getproxy.html?tab=account"
 # Global session management
 last_refresh_time = None
 session_lock = threading.Lock()
+is_logged_in = False
+login_event = threading.Event()
 
 # Configure logging
 logging.basicConfig(
@@ -42,6 +44,7 @@ class ABCProxyMonitorBot:
         self.driver = None
         self.wait = None
         self.application = None
+        self.is_initialized = False
         
     def initialize_driver(self):
         """Initialize the WebDriver"""
@@ -68,23 +71,29 @@ class ABCProxyMonitorBot:
 
     def wait_for_manual_login(self):
         """Wait for manual login by user"""
+        global is_logged_in
+        
         try:
-            logger.info("🔐 Please login manually in the browser...")
-            logger.info("✅ Script will continue automatically after successful login")
+            logger.info("🔐 PLEASE LOGIN MANUALLY IN THE BROWSER WINDOW!")
+            logger.info("⏳ Waiting for you to complete login...")
+            logger.info("✅ Bot will start automatically after successful login")
             
             original_url = self.driver.current_url
             
             # Wait for URL change indicating successful login
             WebDriverWait(self.driver, 300).until(
                 lambda driver: driver.current_url != original_url and 
-                              "login" not in driver.current_url.lower()
+                              "login" not in driver.current_url.lower() and
+                              "center" in driver.current_url.lower()
             )
             
+            is_logged_in = True
+            login_event.set()  # Signal that login is complete
             logger.info(f"✅ Login successful! Current URL: {self.driver.current_url}")
             return True
             
         except TimeoutException:
-            logger.warning("⚠️ Login timeout reached")
+            logger.error("❌ Login timeout reached. Please restart the script and login within 5 minutes.")
             return False
         except Exception as e:
             logger.error(f"❌ Error during login wait: {e}")
@@ -103,7 +112,7 @@ class ABCProxyMonitorBot:
             self.wait.until(EC.presence_of_element_located((By.CLASS_NAME, "all_acu_box")))
             
             # Additional wait for account rows to populate
-            WebDriverWait(self.driver, 10).until(
+            WebDriverWait(self.driver, 15).until(
                 lambda driver: len(driver.find_elements(By.CSS_SELECTOR, ".all_acu_box > div")) > 0
             )
             
@@ -112,6 +121,33 @@ class ABCProxyMonitorBot:
             
         except Exception as e:
             logger.error(f"❌ Failed to navigate to monitor page: {e}")
+            return False
+
+    def setup_browser_session(self):
+        """Setup browser session with login"""
+        global is_logged_in
+        
+        try:
+            logger.info("🚀 Setting up browser session...")
+            
+            if not self.initialize_driver():
+                return False
+                
+            if not self.open_login_url():
+                return False
+                
+            if not self.wait_for_manual_login():
+                return False
+                
+            if not self.navigate_to_monitor_page():
+                return False
+                
+            self.is_initialized = True
+            logger.info("✅ Browser session setup completed successfully")
+            return True
+            
+        except Exception as e:
+            logger.error(f"❌ Browser session setup failed: {e}")
             return False
 
     def refresh_session_if_needed(self):
@@ -127,13 +163,7 @@ class ABCProxyMonitorBot:
                 if self.driver:
                     self.driver.quit()
                 
-                if not self.initialize_driver():
-                    return False
-                if not self.open_login_url():
-                    return False
-                if not self.wait_for_manual_login():
-                    return False
-                if not self.navigate_to_monitor_page():
+                if not self.setup_browser_session():
                     return False
                 
                 last_refresh_time = current_time
@@ -427,18 +457,8 @@ class ABCProxyMonitorBot:
     def run_account_check(self, account_names):
         """Main method to run account check for multiple accounts"""
         try:
-            if not self.driver:
-                if not self.initialize_driver():
-                    return {name: (None, "❌ Failed to initialize browser") for name in account_names}
-                
-                if not self.open_login_url():
-                    return {name: (None, "❌ Failed to open login page") for name in account_names}
-                
-                if not self.wait_for_manual_login():
-                    return {name: (None, "❌ Login failed or timeout") for name in account_names}
-                
-                if not self.navigate_to_monitor_page():
-                    return {name: (None, "❌ Failed to navigate to monitor page") for name in account_names}
+            if not self.is_initialized:
+                return {name: (None, "❌ Bot is not ready. Please wait for login completion.") for name in account_names}
             
             results = self.process_multiple_accounts(account_names)
             return results
@@ -450,6 +470,15 @@ class ABCProxyMonitorBot:
     # Telegram Bot Methods
     async def start_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Send welcome message when the command /start is issued."""
+        global is_logged_in
+        
+        if not is_logged_in:
+            await update.message.reply_text(
+                "⏳ Bot is initializing... Please wait for login completion in the browser window.",
+                parse_mode=ParseMode.MARKDOWN
+            )
+            return
+        
         welcome_message = """
 🤖 *Welcome to ABC Proxy Account Monitor Bot!*
 
@@ -480,6 +509,15 @@ class ABCProxyMonitorBot:
 
     async def handle_account_query(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle account query messages"""
+        global is_logged_in
+        
+        if not is_logged_in:
+            await update.message.reply_text(
+                "❌ Bot is not ready yet. Please wait for login completion in the browser window.",
+                parse_mode=ParseMode.MARKDOWN
+            )
+            return
+            
         user_input = update.message.text.strip()
         chat_id = update.message.chat_id
         
@@ -559,8 +597,14 @@ class ABCProxyMonitorBot:
 
     async def broadcast_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle broadcast messages from admin"""
+        global is_logged_in
+        
         if update.effective_user.id != ADMIN_ID:
             await update.message.reply_text("❌ Unauthorized access.")
+            return
+        
+        if not is_logged_in:
+            await update.message.reply_text("❌ Bot is not ready yet. Please wait for login completion.")
             return
         
         if not context.args:
@@ -577,12 +621,13 @@ class ABCProxyMonitorBot:
 
     async def status_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Show bot status and session info"""
-        global last_refresh_time
+        global last_refresh_time, is_logged_in
         
         status_message = f"""
 🤖 *Bot Status Overview*
 
 *Session Information:*
+• Login Status: {'✅ Logged In' if is_logged_in else '❌ Not Logged In'}
 • Last Refresh: {last_refresh_time.strftime('%Y-%m-%d %H:%M:%S') if last_refresh_time else 'Never'}
 • Next Refresh: {(last_refresh_time + timedelta(minutes=30)).strftime('%Y-%m-%d %H:%M:%S') if last_refresh_time else 'N/A'}
 • Browser Active: {'✅ Yes' if self.driver else '❌ No'}
@@ -601,7 +646,13 @@ Send account names (one per line) for batch checking!
 
     async def handle_media_broadcast(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle media broadcast from admin"""
+        global is_logged_in
+        
         if update.effective_user.id != ADMIN_ID:
+            return
+        
+        if not is_logged_in:
+            await update.message.reply_text("❌ Bot is not ready yet. Please wait for login completion.")
             return
         
         media_type = "Unknown"
@@ -646,18 +697,55 @@ Send account names (one per line) for batch checking!
         logger.info("🤖 Bot is running...")
         self.application.run_polling()
 
+def setup_browser_in_thread(bot):
+    """Setup browser session in a separate thread"""
+    def browser_setup():
+        success = bot.setup_browser_session()
+        if success:
+            logger.info("✅ Browser setup completed. Bot is now ready!")
+        else:
+            logger.error("❌ Browser setup failed. Please check the logs and restart.")
+    
+    browser_thread = threading.Thread(target=browser_setup, daemon=True)
+    browser_thread.start()
+    return browser_thread
+
 def main():
     """Main function"""
     print("🚀 Starting ABC Proxy Account Monitor Bot...")
-    print("📝 Make sure to replace 'YOUR_BOT_TOKEN_HERE' with your actual bot token")
+    print("=" * 50)
+    print("📋 INSTRUCTIONS:")
+    print("1. A browser window will open automatically")
+    print("2. Please LOGIN MANUALLY to ABCProxy website")
+    print("3. Wait for the 'Login successful' message")
+    print("4. Then you can use the Telegram bot")
+    print("=" * 50)
     
     if BOT_TOKEN == "YOUR_BOT_TOKEN_HERE":
         print("❌ ERROR: Please set your bot token in the BOT_TOKEN variable")
         return
     
-    # Create and run the bot
+    # Create the bot
     bot = ABCProxyMonitorBot()
-    bot.run_bot()
+    
+    # Setup browser session in a separate thread
+    print("🔄 Starting browser session...")
+    browser_thread = setup_browser_in_thread(bot)
+    
+    # Wait a moment for browser to start
+    time.sleep(5)
+    
+    # Start the Telegram bot
+    print("🤖 Starting Telegram bot...")
+    try:
+        bot.run_bot()
+    except KeyboardInterrupt:
+        print("\n🛑 Bot stopped by user")
+    except Exception as e:
+        print(f"❌ Bot error: {e}")
+    finally:
+        if bot.driver:
+            bot.driver.quit()
 
 if __name__ == "__main__":
     main()
