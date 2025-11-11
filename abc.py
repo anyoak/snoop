@@ -14,7 +14,7 @@ from telegram.constants import ParseMode
 import threading
 
 # Bot Configuration
-BOT_TOKEN = "8451064449:AAEPx61lC2inHPtHaf3XVoMcSdmopJqJSpg"
+BOT_TOKEN = "8451064449:AAEPx61lC2inHPtHaf3XVoMcSdmopJqJSpg"  # Replace with your actual bot token
 ADMIN_ID = 6577308099
 
 # Website URLs
@@ -23,7 +23,6 @@ BASE_URL = "https://www.abcproxy.com"
 MONITOR_URL = "https://www.abcproxy.com/center/getproxy.html?tab=account"
 
 # Global session management
-browser_session = None
 last_refresh_time = None
 session_lock = threading.Lock()
 
@@ -394,11 +393,6 @@ class ABCProxyMonitorBot:
 - `anam1gbPL2510` (direct account name)
 - `as.domain.com:4950:anam1gbPL2510-zone-region:password` (full proxy string)
 
-*Multiple accounts example:*
-•anam1gbPL2510
-•testuser123
-•as.domain.com:4950:user456-zone-region:pass
-
 *Features:*
 • Account traffic usage with percentage
 • Registration date
@@ -545,8 +539,6 @@ Send account names (one per line) for batch checking!
             media_type = "Photo"
         elif update.message.video:
             media_type = "Video"
-        elif update.message.sticker:
-            media_type = "Sticker"
         elif update.message.document:
             media_type = "Document"
         elif update.message.animation:
@@ -567,9 +559,9 @@ Send account names (one per line) for batch checking!
             self.handle_account_query
         ))
         
-        # Media handlers for admin broadcast
+        # Media handlers for admin broadcast - FIXED FILTERS
         self.application.add_handler(MessageHandler(
-            filters.PHOTO | filters.VIDEO | filters.STICKER | filters.DOCUMENT | filters.ANIMATION,
+            filters.PHOTO | filters.VIDEO | filters.Document.ALL | filters.ANIMATION,
             self.handle_media_broadcast
         ))
         
